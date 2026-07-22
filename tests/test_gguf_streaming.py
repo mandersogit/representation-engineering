@@ -26,10 +26,83 @@ class FixtureTensor:
     name: str
     values: np.ndarray
     qtype: GGMLQuantizationType
+    raw_override: np.ndarray | None = None
 
     @property
     def raw_rows(self) -> np.ndarray:
+        if self.raw_override is not None:
+            return self.raw_override
         return quantize_rows(self.values, self.qtype)
+
+
+def pack_q4_k_block(
+    *,
+    scale: float,
+    min_scale: float,
+    subblock_scales: np.ndarray,
+    subblock_mins: np.ndarray,
+    quants: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Create one independently specified Q4_K block and its FP32 values."""
+
+    subblock_scales = np.asarray(subblock_scales, dtype=np.uint8)
+    subblock_mins = np.asarray(subblock_mins, dtype=np.uint8)
+    quants = np.asarray(quants, dtype=np.uint8)
+    assert subblock_scales.shape == (8,)
+    assert subblock_mins.shape == (8,)
+    assert quants.shape == (8, 32)
+    assert np.all(subblock_scales <= 63)
+    assert np.all(subblock_mins <= 63)
+    assert np.all(quants <= 15)
+
+    first_scales = (subblock_scales[:4] & 0x3F) | ((subblock_scales[4:] & 0x30) << 2)
+    first_mins = (subblock_mins[:4] & 0x3F) | ((subblock_mins[4:] & 0x30) << 2)
+    shared_high = (subblock_scales[4:] & 0x0F) | ((subblock_mins[4:] & 0x0F) << 4)
+    packed_scale_min = np.concatenate([first_scales, first_mins, shared_high]).astype(np.uint8)
+
+    packed_quants = np.concatenate(
+        [
+            quants[2 * group] | (quants[2 * group + 1] << np.uint8(4))
+            for group in range(4)
+        ]
+    )
+    stored_scale = np.float16(scale)
+    stored_min_scale = np.float16(min_scale)
+    raw = np.concatenate(
+        [
+            np.array([stored_scale], dtype=np.float16).view(np.uint8),
+            np.array([stored_min_scale], dtype=np.float16).view(np.uint8),
+            packed_scale_min,
+            packed_quants,
+        ]
+    )
+    expected = (
+        np.float32(stored_scale)
+        * subblock_scales.astype(np.float32)[:, None]
+        * quants
+        - np.float32(stored_min_scale) * subblock_mins.astype(np.float32)[:, None]
+    ).reshape(256)
+    assert raw.shape == (144,)
+    return raw, expected.astype(np.float32)
+
+
+def make_q4_k_fixture_rows() -> tuple[np.ndarray, np.ndarray]:
+    raw_rows = []
+    expected_rows = []
+    for row in range(3):
+        scales = (np.arange(8, dtype=np.uint8) * (row + 3) + 1) % 64
+        mins = (np.arange(8, dtype=np.uint8) * (row + 5) + 2) % 64
+        quants = (np.arange(256, dtype=np.uint16).reshape(8, 32) + 3 * row) % 16
+        raw, expected = pack_q4_k_block(
+            scale=0.0625 * (row + 1),
+            min_scale=0.03125 * (row + 2),
+            subblock_scales=scales,
+            subblock_mins=mins,
+            quants=quants.astype(np.uint8),
+        )
+        raw_rows.append(raw)
+        expected_rows.append(expected)
+    return np.stack(raw_rows), np.stack(expected_rows)
 
 
 class TinyGGUFWriter:
@@ -127,6 +200,7 @@ class TinyGGUFWriter:
 @pytest.fixture
 def tiny_gguf(tmp_path: Path) -> tuple[Path, dict[str, FixtureTensor]]:
     rng = np.random.default_rng(20260722)
+    q4k_raw, q4k_values = make_q4_k_fixture_rows()
     tensors = {
         "f16.weight": FixtureTensor(
             "f16.weight", rng.normal(size=(5, 11)).astype(np.float32), GGMLQuantizationType.F16
@@ -136,6 +210,9 @@ def tiny_gguf(tmp_path: Path) -> tuple[Path, dict[str, FixtureTensor]]:
         ),
         "q4.weight": FixtureTensor(
             "q4.weight", rng.normal(size=(9, 64)).astype(np.float32), GGMLQuantizationType.Q4_0
+        ),
+        "q4k.weight": FixtureTensor(
+            "q4k.weight", q4k_values, GGMLQuantizationType.Q4_K, q4k_raw
         ),
     }
     writer = TinyGGUFWriter()
@@ -164,6 +241,18 @@ def test_manual_q4_0_layout() -> None:
     actual = dequantize_rows(raw, GGMLQuantizationType.Q4_0, 32)
     expected_quants = np.concatenate([low, high]).astype(np.int8) - 8
     np.testing.assert_array_equal(actual[0], expected_quants.astype(np.float32) * 0.25)
+
+
+def test_manual_q4_k_layout() -> None:
+    raw, expected = pack_q4_k_block(
+        scale=0.125,
+        min_scale=0.0625,
+        subblock_scales=np.array([1, 2, 3, 4, 17, 34, 51, 63], dtype=np.uint8),
+        subblock_mins=np.array([0, 5, 10, 15, 16, 31, 48, 63], dtype=np.uint8),
+        quants=(np.arange(256, dtype=np.uint16).reshape(8, 32) % 16).astype(np.uint8),
+    )
+    actual = dequantize_rows(raw.reshape(1, -1), GGMLQuantizationType.Q4_K, 256)
+    np.testing.assert_array_equal(actual[0], expected)
 
 
 def test_reader_parses_metadata_shapes_and_offsets(
@@ -196,7 +285,7 @@ def test_raw_row_chunks_are_mmap_views(
         assert all(isinstance(chunk.data.base, np.memmap) for chunk in chunks)
 
 
-@pytest.mark.parametrize("name", ["f16.weight", "q8.weight", "q4.weight"])
+@pytest.mark.parametrize("name", ["f16.weight", "q8.weight", "q4.weight", "q4k.weight"])
 @pytest.mark.parametrize("max_chunk_bytes", [1, 128, 1024, 1 << 20])
 def test_streamed_left_contraction_matches_dense_reference(
     tiny_gguf: tuple[Path, dict[str, FixtureTensor]],
