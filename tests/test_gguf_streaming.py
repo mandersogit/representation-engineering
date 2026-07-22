@@ -105,6 +105,72 @@ def make_q4_k_fixture_rows() -> tuple[np.ndarray, np.ndarray]:
     return np.stack(raw_rows), np.stack(expected_rows)
 
 
+def pack_q6_k_block(
+    *,
+    scale: float,
+    subblock_scales: np.ndarray,
+    quants: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Create one independently specified Q6_K block and its FP32 values."""
+
+    subblock_scales = np.asarray(subblock_scales, dtype=np.int8)
+    quants = np.asarray(quants, dtype=np.int8)
+    assert subblock_scales.shape == (16,)
+    assert quants.shape == (16, 16)
+    assert np.all(quants >= -32)
+    assert np.all(quants <= 31)
+
+    unsigned = (quants.reshape(8, 32).astype(np.int16) + 32).astype(np.uint8)
+    low = unsigned & np.uint8(0x0F)
+    high = unsigned >> np.uint8(4)
+
+    low_expanded = low.reshape(2, 2, 64)
+    packed_low = low_expanded[:, 0] | (low_expanded[:, 1] << np.uint8(4))
+
+    high_expanded = high.reshape(2, 4, 32)
+    packed_high = (
+        high_expanded[:, 0]
+        | (high_expanded[:, 1] << np.uint8(2))
+        | (high_expanded[:, 2] << np.uint8(4))
+        | (high_expanded[:, 3] << np.uint8(6))
+    )
+
+    stored_scale = np.float16(scale)
+    raw = np.concatenate(
+        [
+            packed_low.reshape(-1),
+            packed_high.reshape(-1),
+            subblock_scales.view(np.uint8),
+            np.array([stored_scale], dtype=np.float16).view(np.uint8),
+        ]
+    )
+    expected = (
+        np.float32(stored_scale)
+        * subblock_scales.astype(np.float32)[:, None]
+        * quants.astype(np.float32)
+    ).reshape(256)
+    assert raw.shape == (210,)
+    return raw, expected.astype(np.float32)
+
+
+def make_q6_k_fixture_rows() -> tuple[np.ndarray, np.ndarray]:
+    raw_rows = []
+    expected_rows = []
+    for row in range(2):
+        scales = ((np.arange(16, dtype=np.int16) * (row + 7) + 3) % 127 - 63).astype(np.int8)
+        quants = (
+            (np.arange(256, dtype=np.int16).reshape(16, 16) + row * 11) % 64 - 32
+        ).astype(np.int8)
+        raw, expected = pack_q6_k_block(
+            scale=0.015625 * (row + 1),
+            subblock_scales=scales,
+            quants=quants,
+        )
+        raw_rows.append(raw)
+        expected_rows.append(expected)
+    return np.stack(raw_rows), np.stack(expected_rows)
+
+
 class TinyGGUFWriter:
     """Test-only GGUF v3 writer with enough metadata variety to test skipping."""
 
@@ -201,6 +267,7 @@ class TinyGGUFWriter:
 def tiny_gguf(tmp_path: Path) -> tuple[Path, dict[str, FixtureTensor]]:
     rng = np.random.default_rng(20260722)
     q4k_raw, q4k_values = make_q4_k_fixture_rows()
+    q6k_raw, q6k_values = make_q6_k_fixture_rows()
     tensors = {
         "f16.weight": FixtureTensor(
             "f16.weight", rng.normal(size=(5, 11)).astype(np.float32), GGMLQuantizationType.F16
@@ -213,6 +280,9 @@ def tiny_gguf(tmp_path: Path) -> tuple[Path, dict[str, FixtureTensor]]:
         ),
         "q4k.weight": FixtureTensor(
             "q4k.weight", q4k_values, GGMLQuantizationType.Q4_K, q4k_raw
+        ),
+        "q6k.weight": FixtureTensor(
+            "q6k.weight", q6k_values, GGMLQuantizationType.Q6_K, q6k_raw
         ),
     }
     writer = TinyGGUFWriter()
@@ -255,6 +325,23 @@ def test_manual_q4_k_layout() -> None:
     np.testing.assert_array_equal(actual[0], expected)
 
 
+def test_manual_q6_k_layout() -> None:
+    scales = np.array(
+        [-63, -47, -31, -15, -1, 1, 7, 15, 23, 31, 39, 47, 55, 63, 12, -12],
+        dtype=np.int8,
+    )
+    quants = (
+        (np.arange(256, dtype=np.int16).reshape(16, 16) * 5) % 64 - 32
+    ).astype(np.int8)
+    raw, expected = pack_q6_k_block(
+        scale=0.03125,
+        subblock_scales=scales,
+        quants=quants,
+    )
+    actual = dequantize_rows(raw.reshape(1, -1), GGMLQuantizationType.Q6_K, 256)
+    np.testing.assert_array_equal(actual[0], expected)
+
+
 def test_reader_parses_metadata_shapes_and_offsets(
     tiny_gguf: tuple[Path, dict[str, FixtureTensor]],
 ) -> None:
@@ -285,7 +372,9 @@ def test_raw_row_chunks_are_mmap_views(
         assert all(isinstance(chunk.data.base, np.memmap) for chunk in chunks)
 
 
-@pytest.mark.parametrize("name", ["f16.weight", "q8.weight", "q4.weight", "q4k.weight"])
+@pytest.mark.parametrize(
+    "name", ["f16.weight", "q8.weight", "q4.weight", "q4k.weight", "q6k.weight"]
+)
 @pytest.mark.parametrize("max_chunk_bytes", [1, 128, 1024, 1 << 20])
 def test_streamed_left_contraction_matches_dense_reference(
     tiny_gguf: tuple[Path, dict[str, FixtureTensor]],
