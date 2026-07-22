@@ -17,8 +17,10 @@ from .projection import (
 )
 from .quantization import GGMLQuantizationType, dequantize_rows, quantize_rows
 from .tensor_source import GGUFWeightSource, TensorChunk
+from .validation import AdapterValidationReport, validate_lora_adapter
 
 __all__ = [
+    "AdapterValidationReport",
     "GGMLQuantizationType",
     "GGUFReader",
     "GGUFTensorInfo",
@@ -35,5 +37,6 @@ __all__ = [
     "left_contract_chunked",
     "orthonormalize_directions",
     "quantize_rows",
+    "validate_lora_adapter",
     "write_lora_adapter",
 ]
