@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+dist/
+build/
+*.egg-info/
+
+# Model and generated artifacts
+*.gguf
+*.safetensors
+models/
+artifacts/
+
+# External source/build trees
+vendor/
+llama.cpp/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
