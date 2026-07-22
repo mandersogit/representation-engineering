@@ -113,6 +113,54 @@ def _dequantize_q4_0(raw_rows: np.ndarray, width: int) -> np.ndarray:
     return values.reshape(rows.shape[0], width)
 
 
+def _unpack_q4_k_scale_min(scales: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Unpack the eight 6-bit scales and minima in a Q4_K block."""
+
+    if scales.ndim != 2 or scales.shape[1] != 12:
+        raise ValueError(f"expected Q4_K scales with shape (n, 12), got {scales.shape}")
+    grouped = scales.reshape(scales.shape[0], 3, 4)
+    low_scales, low_mins, high_bits = np.split(grouped, 3, axis=1)
+    decoded_scales = np.concatenate(
+        [
+            low_scales & np.uint8(0x3F),
+            (high_bits & np.uint8(0x0F))
+            | ((low_scales >> np.uint8(2)) & np.uint8(0x30)),
+        ],
+        axis=-1,
+    )
+    decoded_mins = np.concatenate(
+        [
+            low_mins & np.uint8(0x3F),
+            (high_bits >> np.uint8(4))
+            | ((low_mins >> np.uint8(2)) & np.uint8(0x30)),
+        ],
+        axis=-1,
+    )
+    return (
+        decoded_scales.reshape(scales.shape[0], 8),
+        decoded_mins.reshape(scales.shape[0], 8),
+    )
+
+
+def _dequantize_q4_k(raw_rows: np.ndarray, width: int) -> np.ndarray:
+    row_bytes = row_storage_bytes(width, GGMLQuantizationType.Q4_K)
+    rows = _require_raw_rows(raw_rows, row_bytes)
+    blocks = rows.reshape(-1, 144)
+
+    scales = blocks[:, :2].copy().view(np.float16).astype(np.float32)
+    min_scales = blocks[:, 2:4].copy().view(np.float16).astype(np.float32)
+    subblock_scales, subblock_mins = _unpack_q4_k_scale_min(blocks[:, 4:16])
+
+    effective_scales = (scales * subblock_scales.astype(np.float32)).reshape(-1, 8, 1)
+    effective_mins = (min_scales * subblock_mins.astype(np.float32)).reshape(-1, 8, 1)
+
+    packed = blocks[:, 16:].reshape(-1, 4, 1, 32)
+    quants = packed >> np.array([0, 4], dtype=np.uint8).reshape(1, 1, 2, 1)
+    quants = (quants & np.uint8(0x0F)).reshape(-1, 8, 32).astype(np.float32)
+    values = effective_scales * quants - effective_mins
+    return values.reshape(rows.shape[0], width)
+
+
 def dequantize_rows(
     raw_rows: np.ndarray,
     qtype: GGMLQuantizationType,
@@ -124,7 +172,13 @@ def dequantize_rows(
     rows = _require_raw_rows(raw_rows, row_bytes)
 
     if qtype == GGMLQuantizationType.F32:
-        return rows.copy().reshape(-1).view("<f4").reshape(rows.shape[0], width).astype(np.float32, copy=False)
+        return (
+            rows.copy()
+            .reshape(-1)
+            .view("<f4")
+            .reshape(rows.shape[0], width)
+            .astype(np.float32, copy=False)
+        )
     if qtype == GGMLQuantizationType.F16:
         return rows.copy().reshape(-1).view("<f2").reshape(rows.shape[0], width).astype(np.float32)
     if qtype == GGMLQuantizationType.BF16:
@@ -134,6 +188,8 @@ def dequantize_rows(
         return _dequantize_q8_0(rows, width)
     if qtype == GGMLQuantizationType.Q4_0:
         return _dequantize_q4_0(rows, width)
+    if qtype == GGMLQuantizationType.Q4_K:
+        return _dequantize_q4_k(rows, width)
     raise NotImplementedError(f"dequantization is not implemented for {qtype.name}")
 
 
