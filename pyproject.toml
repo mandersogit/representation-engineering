@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "repreng-gguf"
+version = "0.1.0"
+description = "Memory-bounded representation-engineering operations over GGUF weights"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "representation-engineering contributors" }]
+dependencies = [
+  "torch>=2.2",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+]
+gguf = [
+  "gguf>=0.17",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/repreng_gguf"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
